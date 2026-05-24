@@ -1,0 +1,8 @@
+build/
+*.onnx
+*.mp4
+*.png
+*.o
+*.so
+compile_commands.json
+.cache/
