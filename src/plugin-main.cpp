@@ -60,6 +60,7 @@ struct am_filter {
 	std::atomic<double> blur{22.0};
 	std::atomic<double> alpha_gamma{0.75};
 	std::atomic<int> matte_long{512};
+	std::atomic<int> detail_ratio{75};   // downsample_ratio de RVM en porcentaje
 	uint8_t lut[256];                    // brillo+gamma (UI -> render)
 	std::string model_path;
 
@@ -68,6 +69,7 @@ struct am_filter {
 	Ort::Session *session = nullptr;
 	Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 	std::vector<Ort::Value> rec;
+	int rec_w = 0, rec_h = 0, rec_ratio = 0;
 	bool ort_ok = false;
 
 	// buffers render-thread
@@ -85,6 +87,7 @@ struct am_filter {
 	// salida worker -> render
 	std::mutex out_mtx;
 	std::vector<float> out_alpha;
+	std::vector<uint8_t> out_bgra;       // mismo frame usado para calcular out_alpha
 	int out_w = 0, out_h = 0;
 };
 
@@ -106,6 +109,9 @@ static void reset_states(am_filter *f)
 		int64_t shp[4] = {1, 1, 1, 1};
 		f->rec.push_back(Ort::Value::CreateTensor<float>(f->mem, &zero, 1, shp, 4));
 	}
+	f->rec_w = 0;
+	f->rec_h = 0;
+	f->rec_ratio = 0;
 }
 
 static void ort_init(am_filter *f)
@@ -167,6 +173,15 @@ static void run_matting(am_filter *f, const uint8_t *buf, int W, int H, std::vec
 	float sc = (float)ml / std::max(W, H);
 	int mw = std::max(16, ((int)lround(W * sc) / 16) * 16);
 	int mh = std::max(16, ((int)lround(H * sc) / 16) * 16);
+	int ratio_pct = std::clamp(f->detail_ratio.load(), 40, 100);
+	// Los estados recurrentes de RVM dependen del tamano espacial. Si cambia la
+	// fuente, la calidad o el detalle, los estados anteriores no son compatibles.
+	if (f->rec_w != mw || f->rec_h != mh || f->rec_ratio != ratio_pct) {
+		reset_states(f);
+		f->rec_w = mw;
+		f->rec_h = mh;
+		f->rec_ratio = ratio_pct;
+	}
 
 	std::vector<float> src((size_t)3 * mw * mh);
 	for (int y = 0; y < mh; y++) {
@@ -180,7 +195,7 @@ static void run_matting(am_filter *f, const uint8_t *buf, int W, int H, std::vec
 		}
 	}
 	int64_t src_shape[4] = {1, 3, mh, mw};
-	float dsr = 0.4f; int64_t dsr_shape[1] = {1};
+	float dsr = ratio_pct / 100.0f; int64_t dsr_shape[1] = {1};
 	const char *in_names[6] = {"src","r1i","r2i","r3i","r4i","downsample_ratio"};
 	const char *out_names[5] = {"pha","r1o","r2o","r3o","r4o"};
 
@@ -228,6 +243,7 @@ static void worker_loop(am_filter *f)
 		if (!alpha.empty()) {
 			std::lock_guard<std::mutex> lk(f->out_mtx);
 			f->out_alpha = std::move(alpha);
+			f->out_bgra = std::move(local);
 			f->out_w = W; f->out_h = H;
 		}
 	}
@@ -261,6 +277,7 @@ static void am_update(void *data, obs_data_t *s)
 	f->blur = obs_data_get_double(s, "blur");
 	f->alpha_gamma = obs_data_get_double(s, "alpha_gamma");
 	f->matte_long = (int)obs_data_get_int(s, "quality");
+	f->detail_ratio = (int)obs_data_get_int(s, "detail_ratio");
 	rebuild_lut(f, obs_data_get_double(s, "gain"), obs_data_get_double(s, "gamma"));
 
 	// recarga el modelo si cambió la ruta (también es la carga inicial)
@@ -355,12 +372,17 @@ static void am_render(void *data, gs_effect_t *)
 	}
 	f->in_cv.notify_one();
 
-	// 4) toma el último alpha disponible
+	// 4) toma juntos el último alpha y el frame que produjo ese alpha. Usar la
+	// máscara anterior sobre el frame actual causaba el rastro al moverse.
 	std::vector<float> alpha;
+	std::vector<uint8_t> render_bgra;
 	{
 		std::lock_guard<std::mutex> lk(f->out_mtx);
-		if (f->out_w == (int)w && f->out_h == (int)h && !f->out_alpha.empty())
+		if (f->out_w == (int)w && f->out_h == (int)h && !f->out_alpha.empty() &&
+		    f->out_bgra.size() == (size_t)w * h * 4) {
 			alpha = f->out_alpha;
+			render_bgra = f->out_bgra;
+		}
 	}
 	if (alpha.empty()) { obs_source_skip_video_filter(f->context); return; } // aún sin máscara
 
@@ -369,11 +391,11 @@ static void am_render(void *data, gs_effect_t *)
 	int mode = f->mode.load();
 	if (mode == 1) {
 		std::vector<uint8_t> blurred((size_t)w * h * 4);
-		box_blur_bgra(f->bgra.data(), blurred.data(), w, h, std::max(1, (int)f->blur.load()));
+		box_blur_bgra(render_bgra.data(), blurred.data(), w, h, std::max(1, (int)f->blur.load()));
 		for (size_t i = 0; i < (size_t)w * h; i++) {
 			float a = alpha[i];
 			for (int c = 0; c < 3; c++) {
-				float fg = f->bgra[i*4+c], bg = blurred[i*4+c];
+				float fg = render_bgra[i*4+c], bg = blurred[i*4+c];
 				outbuf[i*4+c] = (uint8_t)std::clamp(bg + (fg-bg)*a, 0.f, 255.f);
 			}
 			outbuf[i*4+3] = 255;
@@ -381,9 +403,9 @@ static void am_render(void *data, gs_effect_t *)
 	} else {
 		for (size_t i = 0; i < (size_t)w * h; i++) {
 			float a = alpha[i];
-			outbuf[i*4+0] = (uint8_t)std::clamp(f->bgra[i*4+0]*a, 0.f, 255.f);
-			outbuf[i*4+1] = (uint8_t)std::clamp(f->bgra[i*4+1]*a, 0.f, 255.f);
-			outbuf[i*4+2] = (uint8_t)std::clamp(f->bgra[i*4+2]*a, 0.f, 255.f);
+			outbuf[i*4+0] = (uint8_t)std::clamp(render_bgra[i*4+0]*a, 0.f, 255.f);
+			outbuf[i*4+1] = (uint8_t)std::clamp(render_bgra[i*4+1]*a, 0.f, 255.f);
+			outbuf[i*4+2] = (uint8_t)std::clamp(render_bgra[i*4+2]*a, 0.f, 255.f);
 			outbuf[i*4+3] = (uint8_t)std::clamp(a*255.f, 0.f, 255.f);
 		}
 	}
@@ -438,6 +460,10 @@ static obs_properties_t *am_props(void *)
 	obs_property_list_add_int(q, "Rapida (384)", 384);
 	obs_property_list_add_int(q, "Media (512)", 512);
 	obs_property_list_add_int(q, "Alta (720)", 720);
+	obs_property_t *d = obs_properties_add_list(p, "detail_ratio", "Detalle interno (manos y cabello)", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(d, "Rapido (0.40)", 40);
+	obs_property_list_add_int(d, "Equilibrado (0.75)", 75);
+	obs_property_list_add_int(d, "Maximo (1.00)", 100);
 	obs_properties_add_path(p, "model_path", "Modelo RVM (.onnx)", OBS_PATH_FILE,
 				"ONNX (*.onnx);;Todos (*.*)", nullptr);
 	return p;
@@ -451,6 +477,7 @@ static void am_defaults(obs_data_t *s)
 	obs_data_set_default_double(s, "gamma", 1.0);
 	obs_data_set_default_double(s, "alpha_gamma", 0.75);
 	obs_data_set_default_int(s, "quality", 512);
+	obs_data_set_default_int(s, "detail_ratio", 75);
 }
 
 static struct obs_source_info am_info = {};
