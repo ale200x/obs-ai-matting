@@ -89,7 +89,30 @@ struct am_filter {
 	std::vector<float> out_alpha;
 	std::vector<uint8_t> out_bgra;       // mismo frame usado para calcular out_alpha
 	int out_w = 0, out_h = 0;
+	float out_fg_mean[3] = {0, 0, 0};    // media BGR 0..1 del sujeto (pond. por alfa)
+	bool out_fg_valid = false;
+
+	// --- igualar luz con el fondo ---
+	std::atomic<bool> auto_match{false};
+	std::atomic<double> match_strength{0.7};
+	std::mutex bg_mtx;                   // protege bg_name + bg_weak (UI <-> render)
+	std::string bg_name;
+	obs_weak_source_t *bg_weak = nullptr;
+	int bg_retry = 0;                    // countdown de reintentos de resolucion
+	gs_texrender_t *bg_texrender = nullptr;
+	gs_stagesurf_t *bg_stage = nullptr;  // BG_W x BG_H fijo
+	bool rendering_bg = false;           // guard de reentrancia (solo hilo grafico)
+	uint32_t frame_idx = 0;
+	int bg_miss = 0;                     // muestreos de fondo fallidos consecutivos
+	// estado del match (solo render thread)
+	float bg_mean[3] = {0, 0, 0};        // media BGR 0..1 del fondo
+	bool bg_valid = false;
+	float auto_gain[3] = {1, 1, 1};      // ganancias suavizadas (EMA)
+	float baked_gain[3] = {1, 1, 1};     // ultimo valor horneado en auto_lut
+	uint8_t auto_lut[3][256];            // gain por canal B/G/R (identidad si off)
 };
+
+static constexpr int BG_W = 64, BG_H = 36;   // tamano del muestreo del fondo
 
 static void rebuild_lut(am_filter *f, double gain, double gamma)
 {
@@ -166,8 +189,10 @@ static void resize_alpha(const float *src, int sw, int sh, float *dst, int dw, i
 	}
 }
 
-// corre RVM sobre buf BGRA(W,H) -> out (W*H alpha). Solo el worker llama esto.
-static void run_matting(am_filter *f, const uint8_t *buf, int W, int H, std::vector<float> &out)
+// corre RVM sobre buf BGRA(W,H) -> out (W*H alpha) + media BGR del sujeto
+// ponderada por alfa (para igualar luz con el fondo). Solo el worker llama esto.
+static void run_matting(am_filter *f, const uint8_t *buf, int W, int H, std::vector<float> &out,
+			float fg_mean[3], float *fg_weight)
 {
 	int ml = f->matte_long.load();
 	float sc = (float)ml / std::max(W, H);
@@ -216,6 +241,25 @@ static void run_matting(am_filter *f, const uint8_t *buf, int W, int H, std::vec
 			if (ag != 1.0) a = powf(a, (float)ag);
 			small[i] = a;
 		}
+		// media BGR del sujeto sobre los buffers pequenos ya existentes (barato).
+		// Alfa continuo como peso: mas estable que un umbral duro con el pelo.
+		if (pw == mw && ph == mh) {
+			double sr = 0, sg = 0, sb = 0, sa = 0;
+			const size_t plane = (size_t)mw * mh;
+			for (size_t i = 0; i < small.size(); i++) {
+				float a = small[i];
+				sa += a;
+				sr += src[i] * a;              // plano 0 = R
+				sg += src[plane + i] * a;      // plano 1 = G
+				sb += src[2 * plane + i] * a;  // plano 2 = B
+			}
+			if (sa > 0) {
+				fg_mean[0] = (float)(sb / sa);
+				fg_mean[1] = (float)(sg / sa);
+				fg_mean[2] = (float)(sr / sa);
+			}
+			*fg_weight = (float)(sa / (double)plane);
+		}
 		out.resize((size_t)W * H);
 		resize_alpha(small.data(), pw, ph, out.data(), W, H);
 		f->rec.clear();
@@ -239,12 +283,15 @@ static void worker_loop(am_filter *f)
 			f->in_new = false;
 		}
 		std::vector<float> alpha;
-		run_matting(f, local.data(), W, H, alpha);
+		float fg_mean[3] = {0, 0, 0}, fg_weight = 0;
+		run_matting(f, local.data(), W, H, alpha, fg_mean, &fg_weight);
 		if (!alpha.empty()) {
 			std::lock_guard<std::mutex> lk(f->out_mtx);
 			f->out_alpha = std::move(alpha);
 			f->out_bgra = std::move(local);
 			f->out_w = W; f->out_h = H;
+			for (int c = 0; c < 3; c++) f->out_fg_mean[c] = fg_mean[c];
+			f->out_fg_valid = fg_weight > 0.02f;  // <2% de sujeto -> invalido
 		}
 	}
 }
@@ -267,6 +314,143 @@ static void start_worker(am_filter *f)
 	f->worker = std::thread(worker_loop, f);
 }
 
+// ---------- igualar luz con el fondo ----------
+
+// bg_mtx debe estar tomado. Suelta la referencia debil y balancea el inc_showing.
+static void release_bg_source(am_filter *f)
+{
+	if (f->bg_weak) {
+		obs_source_t *s = obs_weak_source_get_source(f->bg_weak);
+		if (s) { obs_source_dec_showing(s); obs_source_release(s); }
+		obs_weak_source_release(f->bg_weak);
+		f->bg_weak = nullptr;
+	}
+}
+
+// Devuelve referencia fuerte a la fuente de fondo (el caller libera) o nullptr.
+// Resolucion perezosa por nombre con reintentos: cubre el orden de carga de OBS
+// (la fuente puede no existir aun al crear el filtro) y borrado/recreado en vivo.
+static obs_source_t *acquire_bg_source(am_filter *f)
+{
+	std::lock_guard<std::mutex> lk(f->bg_mtx);
+	if (f->bg_name.empty()) return nullptr;
+	if (f->bg_weak) {
+		obs_source_t *s = obs_weak_source_get_source(f->bg_weak);
+		if (s) return s;
+		obs_weak_source_release(f->bg_weak);  // la fuente murio
+		f->bg_weak = nullptr;
+		blog(LOG_INFO, "[obs-ai-matting] fuente de fondo perdida: %s", f->bg_name.c_str());
+	}
+	if (f->bg_retry-- > 0) return nullptr;  // no martillar la busqueda por nombre
+	f->bg_retry = 4;                        // ~1 s (se llama cada 15 frames)
+	obs_source_t *s = obs_get_source_by_name(f->bg_name.c_str());
+	if (!s) return nullptr;
+	obs_source_inc_showing(s);  // que actualice video aunque no este visible
+	f->bg_weak = obs_source_get_weak_source(s);
+	blog(LOG_INFO, "[obs-ai-matting] fuente de fondo enganchada: %s", f->bg_name.c_str());
+	return s;
+}
+
+// Renderiza la fuente de fondo a BG_W x BG_H (downscale en GPU) y saca su media
+// BGR ponderada por alfa. Corre en el hilo grafico, cada pocos frames.
+static void sample_background(am_filter *f)
+{
+	obs_source_t *bg = acquire_bg_source(f);
+	if (!bg) {
+		if (++f->bg_miss >= 3) f->bg_valid = false;
+		return;
+	}
+	// defensa extra: nunca la propia cadena del filtro
+	if (bg == obs_filter_get_parent(f->context) || bg == obs_filter_get_target(f->context)) {
+		obs_source_release(bg);
+		f->bg_valid = false;
+		return;
+	}
+	uint32_t sw = obs_source_get_width(bg), sh = obs_source_get_height(bg);
+	if (!sw || !sh) { obs_source_release(bg); return; }  // conserva la ultima media
+
+	// Si el fondo es una escena que contiene esta camara, OBS reentra en
+	// am_render; el guard rendering_bg hace que la camara no aporte nada ->
+	// la media es exactamente "la escena sin el sujeto".
+	f->rendering_bg = true;
+	gs_texrender_reset(f->bg_texrender);
+	if (gs_texrender_begin(f->bg_texrender, BG_W, BG_H)) {
+		struct vec4 clr; vec4_zero(&clr);
+		gs_clear(GS_CLEAR_COLOR, &clr, 0.0f, 0);
+		gs_ortho(0.0f, (float)sw, 0.0f, (float)sh, -100.0f, 100.0f);
+		gs_blend_state_push();
+		gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+		obs_source_video_render(bg);
+		gs_blend_state_pop();
+		gs_texrender_end(f->bg_texrender);
+	}
+	f->rendering_bg = false;
+	obs_source_release(bg);
+
+	gs_stage_texture(f->bg_stage, gs_texrender_get_texture(f->bg_texrender));
+	uint8_t *map = nullptr; uint32_t ls = 0;
+	if (!gs_stagesurface_map(f->bg_stage, &map, &ls)) return;
+	double sum[3] = {0, 0, 0}, suma = 0;
+	for (int y = 0; y < BG_H; y++) {
+		const uint8_t *row = map + (size_t)y * ls;
+		for (int x = 0; x < BG_W; x++) {
+			sum[0] += row[x*4+0] / 255.0;
+			sum[1] += row[x*4+1] / 255.0;
+			sum[2] += row[x*4+2] / 255.0;
+			suma   += row[x*4+3] / 255.0;
+		}
+	}
+	gs_stagesurface_unmap(f->bg_stage);
+	if (suma < 0.02 * BG_W * BG_H) { f->bg_valid = false; return; }  // fondo vacio
+	for (int c = 0; c < 3; c++)
+		f->bg_mean[c] = (float)(sum[c] / suma);  // exacto para premultiplicado
+	f->bg_valid = true;
+	f->bg_miss = 0;
+	if ((f->frame_idx % 300) == 0)
+		blog(LOG_DEBUG, "[obs-ai-matting] bg_mean B=%.3f G=%.3f R=%.3f",
+		     f->bg_mean[0], f->bg_mean[1], f->bg_mean[2]);
+}
+
+// Calcula las ganancias objetivo (exposicion parcial + balance de blancos sutil),
+// las suaviza con EMA y hornea las LUTs por canal solo si cambiaron.
+static void update_auto_gains(am_filter *f, const float fg_mean[3], bool fg_valid)
+{
+	float target[3] = {1.f, 1.f, 1.f};
+	if (f->auto_match.load() && f->mode.load() == 0 && f->bg_valid && fg_valid) {
+		auto luma = [](const float m[3]) {  // Rec.709 sobre BGR, gamma-space
+			return std::max(0.0722f*m[0] + 0.7152f*m[1] + 0.2126f*m[2], 0.02f);
+		};
+		float Yf = luma(fg_mean), Yb = luma(f->bg_mean);
+		float st = (float)f->match_strength.load();
+		// exposicion PARCIAL (k=0.55): el sujeto queda algo mas iluminado que
+		// el fondo (convencion de retrato); clamp estrecho para que un fondo
+		// negro no hunda al sujeto hasta lo ilegible.
+		float e = std::clamp(powf(Yb / Yf, 0.55f), 0.70f, 1.40f);
+		for (int c = 0; c < 3; c++) {
+			// balance de blancos: acercar la cromaticidad; el clamp hace
+			// que un fondo de color saturado insinue, no tina.
+			float r = std::clamp((f->bg_mean[c] / Yb) /
+					     std::max(fg_mean[c] / Yf, 0.02f), 0.75f, 1.33f);
+			target[c] = std::clamp(1.f + st * (e * r - 1.f), 0.5f, 2.f);
+		}
+	}
+	// si esta apagado / falta info, target = identidad -> decaimiento suave
+	bool dirty = false;
+	for (int c = 0; c < 3; c++) {
+		f->auto_gain[c] += 0.04f * (target[c] - f->auto_gain[c]);  // ~0.5-1 s
+		if (fabsf(f->auto_gain[c] - f->baked_gain[c]) > 0.002f) dirty = true;
+	}
+	if (!dirty) return;  // LUTs congeladas en reposo -> cero shimmer
+	for (int c = 0; c < 3; c++) {
+		f->baked_gain[c] = f->auto_gain[c];
+		for (int i = 0; i < 256; i++)
+			f->auto_lut[c][i] = (uint8_t)std::clamp(lround(i * f->auto_gain[c]), 0L, 255L);
+	}
+	if ((f->frame_idx % 300) == 0)
+		blog(LOG_DEBUG, "[obs-ai-matting] auto_gain B=%.3f G=%.3f R=%.3f",
+		     f->auto_gain[0], f->auto_gain[1], f->auto_gain[2]);
+}
+
 // ---------- OBS ----------
 static const char *am_get_name(void *) { return "AI Background (Matting)"; }
 
@@ -279,6 +463,18 @@ static void am_update(void *data, obs_data_t *s)
 	f->matte_long = (int)obs_data_get_int(s, "quality");
 	f->detail_ratio = (int)obs_data_get_int(s, "detail_ratio");
 	rebuild_lut(f, obs_data_get_double(s, "gain"), obs_data_get_double(s, "gamma"));
+
+	f->auto_match = obs_data_get_bool(s, "auto_match");
+	f->match_strength = obs_data_get_double(s, "match_strength");
+	const char *bn = obs_data_get_string(s, "bg_source");
+	{
+		std::lock_guard<std::mutex> lk(f->bg_mtx);
+		if (f->bg_name != (bn ? bn : "")) {
+			release_bg_source(f);
+			f->bg_name = bn ? bn : "";
+			f->bg_retry = 0;  // resolver ya en el proximo muestreo
+		}
+	}
 
 	// recarga el modelo si cambió la ruta (también es la carga inicial)
 	std::string np = resolve_model_path(s);
@@ -295,8 +491,12 @@ static void *am_create(obs_data_t *s, obs_source_t *src)
 	auto *f = new am_filter();
 	f->context = src;
 	for (int i = 0; i < 256; i++) f->lut[i] = (uint8_t)i;
+	for (int c = 0; c < 3; c++)
+		for (int i = 0; i < 256; i++) f->auto_lut[c][i] = (uint8_t)i;
 	obs_enter_graphics();
 	f->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+	f->bg_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+	f->bg_stage = gs_stagesurface_create(BG_W, BG_H, GS_BGRA);
 	obs_leave_graphics();
 	am_update(f, s);   // carga modelo + arranca worker
 	return f;
@@ -308,9 +508,15 @@ static void am_destroy(void *data)
 	f->stop = true;
 	f->in_cv.notify_all();
 	if (f->worker.joinable()) f->worker.join();
+	{
+		std::lock_guard<std::mutex> lk(f->bg_mtx);
+		release_bg_source(f);
+	}
 	obs_enter_graphics();
 	if (f->texrender) gs_texrender_destroy(f->texrender);
+	if (f->bg_texrender) gs_texrender_destroy(f->bg_texrender);
 	if (f->stage) gs_stagesurface_destroy(f->stage);
+	if (f->bg_stage) gs_stagesurface_destroy(f->bg_stage);
 	if (f->out_tex) gs_texture_destroy(f->out_tex);
 	obs_leave_graphics();
 	delete f->session;
@@ -321,6 +527,10 @@ static void am_destroy(void *data)
 static void am_render(void *data, gs_effect_t *)
 {
 	auto *f = static_cast<am_filter *>(data);
+	// Reentrado via escena-como-fondo (sample_background renderiza una escena
+	// que contiene esta camara): no aportar nada, asi el muestreo del fondo
+	// mide exactamente "la escena sin el sujeto".
+	if (f->rendering_bg) return;
 	obs_source_t *target = obs_filter_get_target(f->context);
 	if (!target) { obs_source_skip_video_filter(f->context); return; }
 	uint32_t w = obs_source_get_base_width(target);
@@ -335,6 +545,12 @@ static void am_render(void *data, gs_effect_t *)
 		f->out_tex = gs_texture_create(w, h, GS_BGRA, 1, nullptr, GS_DYNAMIC);
 		f->bgra.assign((size_t)w * h * 4, 0);
 	}
+
+	// 0) muestrea el fondo elegido (igualar luz); antes del texrender principal
+	// para no anidar texrenders
+	f->frame_idx++;
+	if (f->auto_match.load() && f->mode.load() == 0 && (f->frame_idx % 15) == 0)
+		sample_background(f);
 
 	// 1) render input -> texrender
 	gs_texrender_reset(f->texrender);
@@ -376,6 +592,8 @@ static void am_render(void *data, gs_effect_t *)
 	// máscara anterior sobre el frame actual causaba el rastro al moverse.
 	std::vector<float> alpha;
 	std::vector<uint8_t> render_bgra;
+	float fg_mean[3] = {0, 0, 0};
+	bool fg_valid = false;
 	{
 		std::lock_guard<std::mutex> lk(f->out_mtx);
 		if (f->out_w == (int)w && f->out_h == (int)h && !f->out_alpha.empty() &&
@@ -383,8 +601,13 @@ static void am_render(void *data, gs_effect_t *)
 			alpha = f->out_alpha;
 			render_bgra = f->out_bgra;
 		}
+		for (int c = 0; c < 3; c++) fg_mean[c] = f->out_fg_mean[c];
+		fg_valid = f->out_fg_valid;
 	}
 	if (alpha.empty()) { obs_source_skip_video_filter(f->context); return; } // aún sin máscara
+
+	// 4b) ganancias del auto-match (EMA + LUTs por canal; identidad si off)
+	update_auto_gains(f, fg_mean, fg_valid);
 
 	// 5) compón
 	std::vector<uint8_t> outbuf((size_t)w * h * 4);
@@ -401,11 +624,15 @@ static void am_render(void *data, gs_effect_t *)
 			outbuf[i*4+3] = 255;
 		}
 	} else {
+		// auto_lut = ganancias del match por canal (identidad si esta off,
+		// misma rama y coste). render_bgra es post-LUT-manual, pre-auto ->
+		// las stats del fg no ven este ajuste (sin bucle de realimentacion).
+		const uint8_t *lb = f->auto_lut[0], *lg = f->auto_lut[1], *lr = f->auto_lut[2];
 		for (size_t i = 0; i < (size_t)w * h; i++) {
 			float a = alpha[i];
-			outbuf[i*4+0] = (uint8_t)std::clamp(render_bgra[i*4+0]*a, 0.f, 255.f);
-			outbuf[i*4+1] = (uint8_t)std::clamp(render_bgra[i*4+1]*a, 0.f, 255.f);
-			outbuf[i*4+2] = (uint8_t)std::clamp(render_bgra[i*4+2]*a, 0.f, 255.f);
+			outbuf[i*4+0] = (uint8_t)std::clamp(lb[render_bgra[i*4+0]]*a, 0.f, 255.f);
+			outbuf[i*4+1] = (uint8_t)std::clamp(lg[render_bgra[i*4+1]]*a, 0.f, 255.f);
+			outbuf[i*4+2] = (uint8_t)std::clamp(lr[render_bgra[i*4+2]]*a, 0.f, 255.f);
 			outbuf[i*4+3] = (uint8_t)std::clamp(a*255.f, 0.f, 255.f);
 		}
 	}
@@ -446,13 +673,51 @@ static void box_blur_bgra(const uint8_t *in, uint8_t *out, int W, int H, int rad
 		}
 }
 
-static obs_properties_t *am_props(void *)
+struct bg_enum_ctx {
+	obs_property_t *list;
+	obs_source_t *parent, *target;
+};
+
+static bool add_bg_source(void *param, obs_source_t *src)
 {
+	auto *ctx = static_cast<bg_enum_ctx *>(param);
+	if (src == ctx->parent || src == ctx->target) return true;
+	if (!(obs_source_get_output_flags(src) & OBS_SOURCE_VIDEO)) return true;
+	const char *name = obs_source_get_name(src);
+	if (name && *name) obs_property_list_add_string(ctx->list, name, name);
+	return true;
+}
+
+static bool am_mode_changed(obs_properties_t *props, obs_property_t *, obs_data_t *s)
+{
+	// el auto-match solo tiene sentido en modo transparente (en blur el fondo
+	// es la propia camara desenfocada: ya es coherente por definicion)
+	bool transp = obs_data_get_int(s, "mode") == 0;
+	obs_property_set_visible(obs_properties_get(props, "auto_match"), transp);
+	obs_property_set_visible(obs_properties_get(props, "bg_source"), transp);
+	obs_property_set_visible(obs_properties_get(props, "match_strength"), transp);
+	return true;
+}
+
+static obs_properties_t *am_props(void *data)
+{
+	auto *f = static_cast<am_filter *>(data);
 	obs_properties_t *p = obs_properties_create();
 	obs_property_t *m = obs_properties_add_list(p, "mode", "Fondo", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(m, "Transparente (pon fondo detras en OBS)", 0);
 	obs_property_list_add_int(m, "Desenfoque (blur)", 1);
+	obs_property_set_modified_callback(m, am_mode_changed);
 	obs_properties_add_float_slider(p, "blur", "Intensidad de blur", 4, 60, 1);
+	// igualar luz con el fondo (solo modo transparente)
+	obs_properties_add_bool(p, "auto_match", "Igualar luz con el fondo (auto)");
+	obs_property_t *bl = obs_properties_add_list(p, "bg_source", "Fuente de fondo",
+			OBS_COMBO_TYPE_EDITABLE, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(bl, "(ninguna)", "");
+	bg_enum_ctx ctx = {bl, f ? obs_filter_get_parent(f->context) : nullptr,
+			       f ? obs_filter_get_target(f->context) : nullptr};
+	obs_enum_scenes(add_bg_source, &ctx);   // las escenas no salen por enum_sources
+	obs_enum_sources(add_bg_source, &ctx);
+	obs_properties_add_float_slider(p, "match_strength", "Intensidad del ajuste", 0.0, 1.0, 0.05);
 	obs_properties_add_float_slider(p, "gain", "Brillo (gain)", 0.5, 4.0, 0.05);
 	obs_properties_add_float_slider(p, "gamma", "Gamma (<1 aclara)", 0.4, 1.6, 0.05);
 	obs_properties_add_float_slider(p, "alpha_gamma", "Dureza de recorte", 0.4, 1.5, 0.05);
@@ -478,6 +743,9 @@ static void am_defaults(obs_data_t *s)
 	obs_data_set_default_double(s, "alpha_gamma", 0.75);
 	obs_data_set_default_int(s, "quality", 512);
 	obs_data_set_default_int(s, "detail_ratio", 75);
+	obs_data_set_default_bool(s, "auto_match", false);
+	obs_data_set_default_string(s, "bg_source", "");
+	obs_data_set_default_double(s, "match_strength", 0.7);
 }
 
 static struct obs_source_info am_info = {};

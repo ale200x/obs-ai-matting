@@ -23,7 +23,9 @@ For questions or ideas, use [Discussions](https://github.com/ale200x/obs-ai-matt
 
 ## Ideas / roadmap
 
-- GPU compositing (shader) instead of CPU.
+- GPU compositing (shader) instead of CPU (the auto light match gains would migrate for
+  free: 3 per-channel gains → shader uniforms).
+- Auto light match v2: contrast matching, edge light wrap / background spill.
 - Bundle/AUR packaging and CI build.
 - More background modes (color key, image fit options).
 - Optional models (e.g. lighter RVM mobilenetv3 for low-end GPUs).

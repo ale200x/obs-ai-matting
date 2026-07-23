@@ -35,6 +35,9 @@ pixel (like a film matte), which is what makes the result look professional.
 - 🟢 **Transparent** mode — outputs the person with alpha; drop any image, **video**, or color
   source *behind* the camera in OBS (native compositing, so any background works).
 - 🌫️ **Background blur** mode — built-in, NVIDIA-Broadcast-style blur.
+- 💡 **Auto light match** — samples the background source you picked in OBS and gently
+  adjusts the subject's exposure and white balance so the cut-out **looks lit by the scene**
+  (subtle by design; strength slider; temporally smoothed, no flicker).
 - ⚡ **Threaded GPU inference** — low latency, doesn't stall OBS rendering (~30 fps).
 - 🎚️ Per-filter settings: background mode, blur strength, **brightness / gamma** (for low
   light), matte hardness, and quality (384 / 512 / 720).
@@ -75,6 +78,9 @@ The plugin finds the model via: the **Modelo RVM (.onnx)** field in the filter �
 3. Choose **Transparente** (then add an image/video/color source *below* the camera for the
    background) or **Desenfoque** (built-in blur).
 4. Tune brightness / gamma / hardness / quality.
+5. *(Optional)* Enable **Igualar luz con el fondo (auto)** and pick your background source
+   (or the whole scene) in **Fuente de fondo** — the subject's light will subtly follow the
+   background. **Intensidad del ajuste** controls how strong the match is.
 
 ## FAQ
 
@@ -99,6 +105,12 @@ recommended for real-time use.
 Yes — use **Transparent** mode and place any OBS Image or Media (video) source behind the
 camera. OBS composites it for you.
 
+**Can the subject's lighting match the background?**
+Yes — enable **auto light match** and select the background source (a scene works too: the
+plugin measures "the scene without you"). It nudges exposure and white balance toward the
+background's average light — a warm background warms you up slightly, a dark one dims you a
+bit — with tight clamps so you always stay readable and never get tinted.
+
 **Is it real-time?**
 Yes. Inference runs on a background thread on the GPU at roughly 30 fps at 512px matting.
 
@@ -108,6 +120,15 @@ Yes. Inference runs on a background thread on the GPU at roughly 30 fps at 512px
 brightness LUT, and hands the frame to a worker thread that runs RVM on CUDA (carrying the
 recurrent states for temporal stability). The render thread composites the latest alpha
 (≈1 frame latency) — transparent (premultiplied) or blurred — and draws it.
+
+**Auto light match**: every 15 frames the filter renders the selected background source at
+64×36 (GPU downscale) and takes its alpha-weighted mean color; the worker computes the
+subject's mean color (alpha-weighted, on the small inference buffers). From both means it
+derives partial-exposure (`(Yb/Yf)^0.55`, clamped) and white-balance per-channel gains,
+smoothed with an EMA and baked into per-channel LUTs applied at composition time. The
+subject stats are taken *before* the auto adjustment, so there is no feedback loop. If the
+background is a scene containing the camera itself, a re-entrancy guard makes the camera
+contribute nothing to the sample — the measurement is exactly "the scene without you".
 
 ## Contributing
 
