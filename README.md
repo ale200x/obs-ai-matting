@@ -14,6 +14,10 @@ It runs **[Robust Video Matting (RVM)](https://github.com/PeterL1n/RobustVideoMa
 **ONNX Runtime + CUDA**, so the cut-out captures fine hair and soft edges and stays stable
 frame-to-frame — far cleaner than the usual *segmentation*-based background removers.
 
+**New in 0.2**: 💡 **auto light match** — the subject's exposure and white balance gently
+follow the background you put behind it in OBS, so you actually look like you're *in* the
+scene instead of pasted on top of it.
+
 > Built and tested on Arch/CachyOS Linux, OBS 32.x, ONNX Runtime 1.24 (CUDA), NVIDIA RTX.
 
 ---
@@ -41,6 +45,7 @@ pixel (like a film matte), which is what makes the result look professional.
 - ⚡ **Threaded GPU inference** — low latency, doesn't stall OBS rendering (~30 fps).
 - 🎚️ Per-filter settings: background mode, blur strength, **brightness / gamma** (for low
   light), matte hardness, and quality (384 / 512 / 720).
+- 🌐 **Localized UI** — English and Spanish, following your OBS language automatically.
 
 ## Requirements
 
@@ -75,12 +80,12 @@ The plugin finds the model via: the **Modelo RVM (.onnx)** field in the filter �
 
 1. Restart OBS.
 2. Right-click your camera source → **Filters** → **+** → **AI Background (Matting)**.
-3. Choose **Transparente** (then add an image/video/color source *below* the camera for the
-   background) or **Desenfoque** (built-in blur).
+3. Choose **Transparent** (then add an image/video/color source *below* the camera for the
+   background) or **Blur** (built-in blur).
 4. Tune brightness / gamma / hardness / quality.
-5. *(Optional)* Enable **Igualar luz con el fondo (auto)** and pick your background source
-   (or the whole scene) in **Fuente de fondo** — the subject's light will subtly follow the
-   background. **Intensidad del ajuste** controls how strong the match is.
+5. *(Optional)* Enable **Match lighting to background (auto)** and pick your background
+   source (or the whole scene) in **Background source** — the subject's light will subtly
+   follow the background. **Match strength** controls how strong the match is.
 
 ## FAQ
 
@@ -145,4 +150,5 @@ Issues, feature requests and pull requests are welcome — see [CONTRIBUTING.md]
 
 <sub>Keywords: OBS Studio background removal Linux, OBS virtual background, OBS background
 blur, virtual green screen Linux, NVIDIA Broadcast alternative Linux, AI webcam background,
-robust video matting, ONNX Runtime CUDA, real-time portrait matting.</sub>
+robust video matting, ONNX Runtime CUDA, real-time portrait matting, auto light match,
+match webcam lighting to background, relight webcam OBS.</sub>

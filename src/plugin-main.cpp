@@ -452,7 +452,7 @@ static void update_auto_gains(am_filter *f, const float fg_mean[3], bool fg_vali
 }
 
 // ---------- OBS ----------
-static const char *am_get_name(void *) { return "AI Background (Matting)"; }
+static const char *am_get_name(void *) { return obs_module_text("FilterName"); }
 
 static void am_update(void *data, obs_data_t *s)
 {
@@ -703,34 +703,34 @@ static obs_properties_t *am_props(void *data)
 {
 	auto *f = static_cast<am_filter *>(data);
 	obs_properties_t *p = obs_properties_create();
-	obs_property_t *m = obs_properties_add_list(p, "mode", "Fondo", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(m, "Transparente (pon fondo detras en OBS)", 0);
-	obs_property_list_add_int(m, "Desenfoque (blur)", 1);
+	obs_property_t *m = obs_properties_add_list(p, "mode", obs_module_text("Mode"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(m, obs_module_text("Mode.Transparent"), 0);
+	obs_property_list_add_int(m, obs_module_text("Mode.Blur"), 1);
 	obs_property_set_modified_callback(m, am_mode_changed);
-	obs_properties_add_float_slider(p, "blur", "Intensidad de blur", 4, 60, 1);
+	obs_properties_add_float_slider(p, "blur", obs_module_text("BlurStrength"), 4, 60, 1);
 	// igualar luz con el fondo (solo modo transparente)
-	obs_properties_add_bool(p, "auto_match", "Igualar luz con el fondo (auto)");
-	obs_property_t *bl = obs_properties_add_list(p, "bg_source", "Fuente de fondo",
+	obs_properties_add_bool(p, "auto_match", obs_module_text("AutoMatch"));
+	obs_property_t *bl = obs_properties_add_list(p, "bg_source", obs_module_text("BgSource"),
 			OBS_COMBO_TYPE_EDITABLE, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(bl, "(ninguna)", "");
+	obs_property_list_add_string(bl, obs_module_text("BgSource.None"), "");
 	bg_enum_ctx ctx = {bl, f ? obs_filter_get_parent(f->context) : nullptr,
 			       f ? obs_filter_get_target(f->context) : nullptr};
 	obs_enum_scenes(add_bg_source, &ctx);   // las escenas no salen por enum_sources
 	obs_enum_sources(add_bg_source, &ctx);
-	obs_properties_add_float_slider(p, "match_strength", "Intensidad del ajuste", 0.0, 1.0, 0.05);
-	obs_properties_add_float_slider(p, "gain", "Brillo (gain)", 0.5, 4.0, 0.05);
-	obs_properties_add_float_slider(p, "gamma", "Gamma (<1 aclara)", 0.4, 1.6, 0.05);
-	obs_properties_add_float_slider(p, "alpha_gamma", "Dureza de recorte", 0.4, 1.5, 0.05);
-	obs_property_t *q = obs_properties_add_list(p, "quality", "Calidad de recorte", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(q, "Rapida (384)", 384);
-	obs_property_list_add_int(q, "Media (512)", 512);
-	obs_property_list_add_int(q, "Alta (720)", 720);
-	obs_property_t *d = obs_properties_add_list(p, "detail_ratio", "Detalle interno (manos y cabello)", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(d, "Rapido (0.40)", 40);
-	obs_property_list_add_int(d, "Equilibrado (0.75)", 75);
-	obs_property_list_add_int(d, "Maximo (1.00)", 100);
-	obs_properties_add_path(p, "model_path", "Modelo RVM (.onnx)", OBS_PATH_FILE,
-				"ONNX (*.onnx);;Todos (*.*)", nullptr);
+	obs_properties_add_float_slider(p, "match_strength", obs_module_text("MatchStrength"), 0.0, 1.0, 0.05);
+	obs_properties_add_float_slider(p, "gain", obs_module_text("Gain"), 0.5, 4.0, 0.05);
+	obs_properties_add_float_slider(p, "gamma", obs_module_text("Gamma"), 0.4, 1.6, 0.05);
+	obs_properties_add_float_slider(p, "alpha_gamma", obs_module_text("AlphaGamma"), 0.4, 1.5, 0.05);
+	obs_property_t *q = obs_properties_add_list(p, "quality", obs_module_text("Quality"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(q, obs_module_text("Quality.Fast"), 384);
+	obs_property_list_add_int(q, obs_module_text("Quality.Medium"), 512);
+	obs_property_list_add_int(q, obs_module_text("Quality.High"), 720);
+	obs_property_t *d = obs_properties_add_list(p, "detail_ratio", obs_module_text("Detail"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(d, obs_module_text("Detail.Fast"), 40);
+	obs_property_list_add_int(d, obs_module_text("Detail.Balanced"), 75);
+	obs_property_list_add_int(d, obs_module_text("Detail.Max"), 100);
+	obs_properties_add_path(p, "model_path", obs_module_text("ModelPath"), OBS_PATH_FILE,
+				obs_module_text("ModelFilter"), nullptr);
 	return p;
 }
 
