@@ -2,6 +2,7 @@ build/
 *.onnx
 *.mp4
 *.png
+!assets/*.png
 *.o
 *.so
 compile_commands.json

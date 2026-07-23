@@ -97,6 +97,13 @@ The plugin finds the model via: the **Modelo RVM (.onnx)** field in the filter �
    source (or the whole scene) in **Background source** — the subject's light will subtly
    follow the background. **Match strength** controls how strong the match is.
 
+<p align="center">
+  <img src="assets/filter-settings.png" alt="Filter settings panel in OBS with auto light match enabled: background mode, blur strength, match lighting checkbox, background source, match strength, brightness, gamma and matte hardness" width="70%">
+  <br>
+  <sub>The filter's settings with <b>auto light match</b> enabled — while running at
+  <b>60 fps with ~13% CPU</b> (laptop RTX 4050, 512 px matting).</sub>
+</p>
+
 ## FAQ
 
 **Is there a NVIDIA Broadcast for Linux?**
