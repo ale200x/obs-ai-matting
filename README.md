@@ -18,6 +18,16 @@ frame-to-frame — far cleaner than the usual *segmentation*-based background re
 follow the background you put behind it in OBS, so you actually look like you're *in* the
 scene instead of pasted on top of it.
 
+<p align="center">
+  <img src="assets/lightmatch-grid.jpg" alt="Auto light match demo — same camera and pose across three backgrounds: the subject cools down in a blue sci-fi room, warms up in a red neon tunnel, and brightens in a white office" width="100%">
+  <br>
+  <sub><b>Auto light match in action</b> — same camera, same pose, real time: skin tone cools
+  down in the blue sci-fi room, picks up the warm cast in the neon tunnel, and brightens in
+  the white office. (<a href="assets/lightmatch-scifi-blue.jpg">full-size 1</a> ·
+  <a href="assets/lightmatch-neon-warm.jpg">2</a> ·
+  <a href="assets/lightmatch-office-bright.jpg">3</a>)</sub>
+</p>
+
 > Built and tested on Arch/CachyOS Linux, OBS 32.x, ONNX Runtime 1.24 (CUDA), NVIDIA RTX.
 
 ---
