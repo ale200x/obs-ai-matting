@@ -149,20 +149,39 @@ static void ort_init(am_filter *f)
 	}
 	try {
 		f->env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "obs-ai-matting");
-		Ort::SessionOptions so;
-		so.SetIntraOpNumThreads(1);
 		bool cuda = false;
-		for (auto &p : Ort::GetAvailableProviders())
+		for (auto &p : Ort::GetAvailableProviders()) {
 			if (p == "CUDAExecutionProvider") cuda = true;
-		if (cuda) {
-			OrtCUDAProviderOptions cu{};
-			cu.device_id = 0;
-			so.AppendExecutionProvider_CUDA(cu);
-			blog(LOG_INFO, "[obs-ai-matting] CUDA ON");
-		} else {
-			blog(LOG_WARNING, "[obs-ai-matting] sin CUDA -> CPU");
 		}
-		f->session = new Ort::Session(*f->env, f->model_path.c_str(), so);
+
+		// Que el proveedor figure como disponible no garantiza que sus bibliotecas
+		// puedan cargarse (por ejemplo, tras una actualización de CUDA/cuDNN). En
+		// ese caso no debemos dejar el filtro vivo pero sin máscara: reintentamos
+		// con una sesión nueva que usa el proveedor CPU integrado.
+		if (cuda) {
+			try {
+				Ort::SessionOptions so;
+				so.SetIntraOpNumThreads(1);
+				OrtCUDAProviderOptions cu{};
+				cu.device_id = 0;
+				so.AppendExecutionProvider_CUDA(cu);
+				f->session = new Ort::Session(*f->env, f->model_path.c_str(), so);
+				blog(LOG_INFO, "[obs-ai-matting] CUDA ON");
+			} catch (const std::exception &e) {
+				delete f->session; f->session = nullptr;
+				blog(LOG_WARNING, "[obs-ai-matting] CUDA no disponible (%s); "
+					"probando respaldo CPU", e.what());
+			}
+		}
+
+		if (!f->session) {
+			Ort::SessionOptions so;
+			unsigned int threads = std::thread::hardware_concurrency();
+			so.SetIntraOpNumThreads((int)std::clamp(threads, 1u, 8u));
+			so.SetInterOpNumThreads(1);
+			f->session = new Ort::Session(*f->env, f->model_path.c_str(), so);
+			blog(LOG_WARNING, "[obs-ai-matting] respaldo CPU ON");
+		}
 		reset_states(f);
 		f->ort_ok = true;
 		blog(LOG_INFO, "[obs-ai-matting] modelo: %s", f->model_path.c_str());

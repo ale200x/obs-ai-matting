@@ -61,7 +61,8 @@ pixel (like a film matte), which is what makes the result look professional.
 
 - OBS Studio 28+ (with `libobs` headers) — tested on 32.x
 - ONNX Runtime with the **CUDA** execution provider (e.g. Arch `onnxruntime-opt-cuda`)
-- NVIDIA GPU + CUDA + cuDNN (CPU fallback works but is slower)
+- NVIDIA GPU + CUDA + cuDNN (if CUDA is unavailable or fails to initialize, the plugin
+  falls back to CPU instead of disabling the matte)
 - CMake and a C++17 compiler
 
 ## Build & install
@@ -135,6 +136,9 @@ bit — with tight clamps so you always stay readable and never get tinted.
 
 **Is it real-time?**
 Yes. Inference runs on a background thread on the GPU at roughly 30 fps at 512px matting.
+If the CUDA provider cannot start, the plugin automatically falls back to CPU and writes a
+warning to the OBS log. CPU performance depends on the processor; use 384 or 512 quality
+instead of 720 for a more responsive preview.
 
 ## How it works
 
