@@ -1,0 +1,26 @@
+_model_hint() {
+    cat <<'EOF'
+
+  obs-ai-matting needs the RVM model, which is NOT bundled (GPL-3.0, ~107 MB):
+
+      mkdir -p ~/.local/share/obs-ai-matting/models
+      curl -L -o ~/.local/share/obs-ai-matting/models/rvm_resnet50.onnx \
+        https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_resnet50_fp32.onnx
+
+  Then restart OBS and add the filter "AI Background (Matting)" to your camera source.
+
+EOF
+}
+
+post_install() {
+    _model_hint
+}
+
+post_upgrade() {
+    cat <<'EOF'
+
+  Restart OBS to load the rebuilt plugin. Until you do, OBS keeps the old module
+  mapped and the filter's settings stay as they are.
+
+EOF
+}

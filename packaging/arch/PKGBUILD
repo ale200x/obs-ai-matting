@@ -1,0 +1,61 @@
+# Maintainer: ale200x <80137478+ale200x@users.noreply.github.com>
+pkgname=obs-ai-matting-git
+_pkgname=obs-ai-matting
+pkgver=0.2.0.r0.g0000000
+pkgrel=1
+pkgdesc="OBS Studio filter: real-time AI background removal, blur and virtual green screen (RVM matting on GPU)"
+arch=('x86_64')
+url="https://github.com/ale200x/obs-ai-matting"
+license=('GPL-2.0-only')
+depends=('obs-studio')
+makedepends=('cmake' 'git' 'binutils')
+optdepends=(
+    'onnxruntime-opt-cuda: GPU (CUDA) inference — strongly recommended for real-time use'
+    'cuda: CUDA runtime for GPU inference'
+    'cudnn: required by the ONNX Runtime CUDA provider'
+)
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+install="$pkgname.install"
+source=("git+https://github.com/ale200x/obs-ai-matting.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/$_pkgname"
+    git describe --long --tags 2>/dev/null | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g' \
+        || printf "0.2.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+    cmake -B build -S "$_pkgname" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DSYSTEM_INSTALL=ON
+    cmake --build build
+}
+
+package() {
+    DESTDIR="$pkgdir" cmake --install build
+
+    # Atar el paquete a la SERIE de ONNX Runtime contra la que se compiló.
+    #
+    # Por qué no alcanza con depender de 'onnxruntime' a secas: onnxruntime exporta
+    # SÍMBOLOS VERSIONADOS (VERS_1.29.0) y los cambia en cada minor SIN cambiar el
+    # soname (sigue siendo libonnxruntime.so.1). El resultado es que pacman ve la
+    # dependencia satisfecha, el plugin deja de cargar en silencio y OBS BORRA el
+    # filtro de la escena con todos sus ajustes. Por eso se lee del binario el
+    # símbolo que exige y se pide esa serie: el update de onnxruntime pasa a exigir
+    # una reconstrucción del plugin en vez de romperlo sin avisar.
+    local _vers _cur _next
+    _vers="$(objdump -p build/obs-ai-matting.so | grep -oE 'VERS_[0-9]+\.[0-9]+' | sort -uV | tail -1)"
+    if [[ -n "$_vers" ]]; then
+        _cur="${_vers#VERS_}"
+        _next="$(awk -F. '{print $1"."$2+1}' <<<"$_cur")"
+        depends+=("onnxruntime>=$_cur" "onnxruntime<$_next")
+    else
+        depends+=('onnxruntime')
+    fi
+
+    install -Dm644 "$_pkgname/README.md" -t "$pkgdir/usr/share/doc/$pkgname/"
+    install -Dm644 "$_pkgname/LICENSE" -t "$pkgdir/usr/share/licenses/$pkgname/"
+}

@@ -39,8 +39,13 @@ static std::string resolve_model_path(obs_data_t *s)
 		if (*env && file_exists(env)) return env;
 	const char *home = getenv("HOME");
 	std::string h = home ? home : "";
+	const char *xdg = getenv("XDG_DATA_HOME");
+	std::string data = (xdg && *xdg) ? xdg : (h + "/.local/share");
 	std::vector<std::string> cand = {
 		h + "/.config/obs-studio/plugins/obs-ai-matting/models/rvm_resnet50.onnx",
+		// instalación por paquete (el plugin vive en /usr, el modelo no se empaqueta)
+		data + "/obs-ai-matting/models/rvm_resnet50.onnx",
+		"/usr/share/obs-ai-matting/models/rvm_resnet50.onnx",
 		h + "/ai-camera/models/rvm_resnet50.onnx",
 	};
 	for (auto &c : cand) if (file_exists(c)) return c;

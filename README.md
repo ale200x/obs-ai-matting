@@ -65,13 +65,30 @@ pixel (like a film matte), which is what makes the result look professional.
   falls back to CPU instead of disabling the matte)
 - CMake and a C++17 compiler
 
-## Build & install
+## Install on Arch Linux (recommended)
+
+```bash
+git clone https://github.com/ale200x/obs-ai-matting.git
+cd obs-ai-matting/packaging/arch
+makepkg -si
+```
+
+The package pins the **ONNX Runtime series it was built against** on purpose — see
+[the filter disappeared after a system update](#the-filter-disappeared-after-a-system-update)
+for why that matters. Upgrading ONNX Runtime will then ask you to rebuild the plugin
+instead of silently breaking it.
+
+## Build & install manually
 
 ```bash
 cmake -B build -S .
 cmake --build build
 cmake --install build      # -> ~/.config/obs-studio/plugins/obs-ai-matting/
 ```
+
+⚠️ A manual install is **not tracked by your package manager**: when ONNX Runtime is
+upgraded you must re-run those three commands yourself, or the filter stops loading
+(again, see [below](#the-filter-disappeared-after-a-system-update)).
 
 ## Download the model (required, not bundled)
 
@@ -83,8 +100,18 @@ curl -L -o ~/.config/obs-studio/plugins/obs-ai-matting/models/rvm_resnet50.onnx 
   https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_resnet50_fp32.onnx
 ```
 
+If you installed the **package**, put it where the plugin looks for it outside the
+home-layout instead:
+
+```bash
+mkdir -p ~/.local/share/obs-ai-matting/models
+curl -L -o ~/.local/share/obs-ai-matting/models/rvm_resnet50.onnx \
+  https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_resnet50_fp32.onnx
+```
+
 The plugin finds the model via: the **Modelo RVM (.onnx)** field in the filter → the
 `$OBS_AI_MATTING_MODEL` env var → `~/.config/obs-studio/plugins/obs-ai-matting/models/` →
+`$XDG_DATA_HOME/obs-ai-matting/models/` → `/usr/share/obs-ai-matting/models/` →
 `~/ai-camera/models/`.
 
 ## Usage
@@ -104,6 +131,49 @@ The plugin finds the model via: the **Modelo RVM (.onnx)** field in the filter �
   <sub>The filter's settings with <b>auto light match</b> enabled — while running at
   <b>60 fps with ~13% CPU</b> (laptop RTX 4050, 512 px matting).</sub>
 </p>
+
+## Troubleshooting
+
+### The filter disappeared after a system update
+
+**Symptom:** *"AI Background (Matting)"* is gone from the filter list — and OBS also
+**removed the filter from your scene**, along with all of its settings.
+
+**Check the OBS log** (`Help → Log Files → Show Log Files`, or
+`~/.config/obs-studio/logs/`) for this:
+
+```
+os_dlopen(...obs-ai-matting.so): /usr/lib/libonnxruntime.so.1:
+  version `VERS_1.28.0' not found (required by ...obs-ai-matting.so)
+Module '...obs-ai-matting.so' not loaded
+Source ID 'obs_ai_matting' not found
+Failed to create source 'AI Background (Matting)'!
+```
+
+**Cause:** ONNX Runtime exports **versioned symbols** (`VERS_1.28.0`, `VERS_1.29.0`, …)
+and bumps them on every minor release **without changing the soname** — it stays
+`libonnxruntime.so.1`. So nothing looks broken from the outside: the library is there,
+the soname matches, but the plugin was linked against symbols the new build no longer
+exports. It stops loading. And because OBS can't resolve the source ID, it drops the
+filter from the scene the next time it saves — that's why your settings vanish too.
+
+The same thing happens if `obs-studio` bumps the `libobs` soname.
+
+**Fix** — rebuild it against the current libraries:
+
+```bash
+cmake --build build && cmake --install build   # manual install
+# or, if you installed the package:
+cd packaging/arch && makepkg -si
+```
+
+Then **restart OBS** and add the filter to your camera source again.
+
+**Avoid it:** install the **[Arch package](#install-on-arch-linux-recommended)**. It pins
+the ONNX Runtime series it was built against, so the upgrade asks you to rebuild the
+plugin instead of leaving you with a module that no longer loads. If you build manually,
+rebuild the plugin **before** opening OBS after an ONNX Runtime upgrade — once OBS opens
+with a broken module, the filter (and its settings) are already gone from the scene.
 
 ## FAQ
 
