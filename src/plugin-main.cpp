@@ -8,6 +8,7 @@
 // Inferencia en hilo aparte (baja latencia). Modos: transparente o blur.
 #include <obs-module.h>
 #include <graphics/graphics.h>
+#include <util/platform.h>
 #include <onnxruntime_cxx_api.h>
 #include <vector>
 #include <string>
@@ -19,6 +20,7 @@
 #include <atomic>
 #include <fstream>
 #include <cstdlib>
+#include <dlfcn.h>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-ai-matting", "en-US")
@@ -94,6 +96,20 @@ struct am_filter {
 	std::vector<float> out_alpha;
 	std::vector<uint8_t> out_bgra;       // mismo frame usado para calcular out_alpha
 	int out_w = 0, out_h = 0;
+
+	// --- instrumentacion (OBS_AI_MATTING_STATS=1) ---
+	// La metrica que importa es la EDAD del frame mostrado: como el render compone
+	// el frame que produjo el alpha (no el actual), la latencia del filtro es
+	// exactamente cuanto tardo ese frame en volver del worker.
+	bool stats_on = false;
+	uint64_t in_ts = 0;                  // ts de captura del frame entregado (in_mtx)
+	uint64_t out_ts = 0;                 // ts de captura del frame de out_alpha (out_mtx)
+	uint64_t st_infer_ns = 0;            // acumulados del worker (bajo out_mtx)
+	uint32_t st_infer_n = 0;
+	// acumulados del hilo grafico (sin mutex: solo los toca am_render)
+	uint64_t st_infer_acc_ns = 0, st_render_ns = 0, st_age_ns = 0;
+	uint32_t st_infer_acc_n = 0, st_render_n = 0, st_age_n = 0, st_deliver_n = 0;
+	uint64_t st_last_log = 0;
 	float out_fg_mean[3] = {0, 0, 0};    // media BGR 0..1 del sujeto (pond. por alfa)
 	bool out_fg_valid = false;
 
@@ -142,6 +158,31 @@ static void reset_states(am_filter *f)
 	f->rec_ratio = 0;
 }
 
+// ONNX Runtime carga libonnxruntime_providers_cuda.so con dlopen, pero ese .so
+// NO enlaza libcudnn (no aparece en sus NEEDED): da por hecho que los simbolos
+// de cuDNN ya estan en el espacio global del proceso. Cuando quien hospeda el
+// plugin no la ha cargado —el caso de OBS—, el provider falla con
+// "undefined symbol: cudnnGetConvolutionBackwardDataAlgorithm_v7" y CUDA queda
+// descartado. Cargarla nosotros con RTLD_GLOBAL antes de pedir el provider
+// resuelve esos simbolos. Verificado con onnxruntime-opt-cuda 1.29.0-2 +
+// cudnn 9.25.1.1 (Arch/CachyOS): sin esto la inferencia caia a CPU y pasaba de
+// ~35 ms a ~250 ms por frame, en silencio.
+static bool preload_cudnn()
+{
+	static int state = -1;   // -1 sin intentar, 1 cargada, 0 no se pudo
+	if (state >= 0) return state == 1;
+	for (const char *name : {"libcudnn.so.9", "libcudnn.so"}) {
+		if (dlopen(name, RTLD_NOW | RTLD_GLOBAL)) {
+			blog(LOG_INFO, "[obs-ai-matting] cuDNN precargada (%s)", name);
+			state = 1;
+			return true;
+		}
+	}
+	blog(LOG_INFO, "[obs-ai-matting] cuDNN no se pudo precargar (%s)", dlerror());
+	state = 0;
+	return false;
+}
+
 static void ort_init(am_filter *f)
 {
 	delete f->session; f->session = nullptr;
@@ -164,6 +205,7 @@ static void ort_init(am_filter *f)
 		// ese caso no debemos dejar el filtro vivo pero sin máscara: reintentamos
 		// con una sesión nueva que usa el proveedor CPU integrado.
 		if (cuda) {
+			preload_cudnn();   // ver comentario arriba: sin esto el provider no carga
 			try {
 				Ort::SessionOptions so;
 				so.SetIntraOpNumThreads(1);
@@ -185,7 +227,13 @@ static void ort_init(am_filter *f)
 			so.SetIntraOpNumThreads((int)std::clamp(threads, 1u, 8u));
 			so.SetInterOpNumThreads(1);
 			f->session = new Ort::Session(*f->env, f->model_path.c_str(), so);
-			blog(LOG_WARNING, "[obs-ai-matting] respaldo CPU ON");
+			// Ruidoso a proposito: el filtro SIGUE FUNCIONANDO, solo que ~7x
+			// mas lento, asi que la degradacion no se nota como una rotura
+			// sino como "hoy va raro" y puede durar semanas sin diagnosticarse.
+			blog(LOG_ERROR, "[obs-ai-matting] *** RESPALDO CPU ACTIVO *** el matting "
+			     "corre en CPU: ~250 ms por frame en vez de ~35 ms, con medio segundo "
+			     "de retraso en camara virtual. Revisa que onnxruntime-opt-cuda, cuda "
+			     "y cudnn sean compatibles entre si.");
 		}
 		reset_states(f);
 		f->ort_ok = true;
@@ -297,15 +345,16 @@ static void run_matting(am_filter *f, const uint8_t *buf, int W, int H, std::vec
 
 static void worker_loop(am_filter *f)
 {
-	std::vector<uint8_t> local; int W, H;
+	std::vector<uint8_t> local; int W, H; uint64_t ts;
 	while (!f->stop.load()) {
 		{
 			std::unique_lock<std::mutex> lk(f->in_mtx);
 			f->in_cv.wait(lk, [&]{ return f->in_new || f->stop.load(); });
 			if (f->stop.load()) break;
-			local = f->in_bgra; W = f->in_w; H = f->in_h;
+			local = f->in_bgra; W = f->in_w; H = f->in_h; ts = f->in_ts;
 			f->in_new = false;
 		}
+		uint64_t t0 = f->stats_on ? os_gettime_ns() : 0;
 		std::vector<float> alpha;
 		float fg_mean[3] = {0, 0, 0}, fg_weight = 0;
 		run_matting(f, local.data(), W, H, alpha, fg_mean, &fg_weight);
@@ -314,8 +363,10 @@ static void worker_loop(am_filter *f)
 			f->out_alpha = std::move(alpha);
 			f->out_bgra = std::move(local);
 			f->out_w = W; f->out_h = H;
+			f->out_ts = ts;
 			for (int c = 0; c < 3; c++) f->out_fg_mean[c] = fg_mean[c];
 			f->out_fg_valid = fg_weight > 0.02f;  // <2% de sujeto -> invalido
+			if (f->stats_on) { f->st_infer_ns += os_gettime_ns() - t0; f->st_infer_n++; }
 		}
 	}
 }
@@ -514,6 +565,8 @@ static void *am_create(obs_data_t *s, obs_source_t *src)
 {
 	auto *f = new am_filter();
 	f->context = src;
+	if (const char *sv = getenv("OBS_AI_MATTING_STATS")) f->stats_on = (*sv && *sv != '0');
+	if (f->stats_on) blog(LOG_INFO, "[obs-ai-matting] stats ON");
 	for (int i = 0; i < 256; i++) f->lut[i] = (uint8_t)i;
 	for (int c = 0; c < 3; c++)
 		for (int i = 0; i < 256; i++) f->auto_lut[c][i] = (uint8_t)i;
@@ -555,6 +608,7 @@ static void am_render(void *data, gs_effect_t *)
 	// que contiene esta camara): no aportar nada, asi el muestreo del fondo
 	// mide exactamente "la escena sin el sujeto".
 	if (f->rendering_bg) return;
+	const uint64_t t_render0 = os_gettime_ns();
 	obs_source_t *target = obs_filter_get_target(f->context);
 	if (!target) { obs_source_skip_video_filter(f->context); return; }
 	uint32_t w = obs_source_get_base_width(target);
@@ -609,8 +663,10 @@ static void am_render(void *data, gs_effect_t *)
 	{
 		std::lock_guard<std::mutex> lk(f->in_mtx);
 		f->in_bgra = f->bgra; f->in_w = w; f->in_h = h; f->in_new = true;
+		f->in_ts = t_render0;
 	}
 	f->in_cv.notify_one();
+	if (f->stats_on) f->st_deliver_n++;
 
 	// 4) toma juntos el último alpha y el frame que produjo ese alpha. Usar la
 	// máscara anterior sobre el frame actual causaba el rastro al moverse.
@@ -618,15 +674,27 @@ static void am_render(void *data, gs_effect_t *)
 	std::vector<uint8_t> render_bgra;
 	float fg_mean[3] = {0, 0, 0};
 	bool fg_valid = false;
+	uint64_t frame_ts = 0;
+	uint64_t infer_ns = 0; uint32_t infer_n = 0;
 	{
 		std::lock_guard<std::mutex> lk(f->out_mtx);
 		if (f->out_w == (int)w && f->out_h == (int)h && !f->out_alpha.empty() &&
 		    f->out_bgra.size() == (size_t)w * h * 4) {
 			alpha = f->out_alpha;
 			render_bgra = f->out_bgra;
+			frame_ts = f->out_ts;
 		}
 		for (int c = 0; c < 3; c++) fg_mean[c] = f->out_fg_mean[c];
 		fg_valid = f->out_fg_valid;
+		if (f->stats_on) {   // vacia los acumuladores del worker (los suma el render)
+			infer_ns = f->st_infer_ns; infer_n = f->st_infer_n;
+			f->st_infer_ns = 0; f->st_infer_n = 0;
+		}
+	}
+	// edad del frame que estamos por mostrar = latencia real del filtro
+	if (f->stats_on) {
+		if (frame_ts) { f->st_age_ns += t_render0 - frame_ts; f->st_age_n++; }
+		f->st_infer_acc_ns += infer_ns; f->st_infer_acc_n += infer_n;
 	}
 	if (alpha.empty()) { obs_source_skip_video_filter(f->context); return; } // aún sin máscara
 
@@ -669,6 +737,28 @@ static void am_render(void *data, gs_effect_t *)
 	gs_effect_set_texture(image, f->out_tex);
 	while (gs_effect_loop(def, "Draw"))
 		gs_draw_sprite(f->out_tex, 0, w, h);
+
+	// 7) stats (OBS_AI_MATTING_STATS=1). "edad" es la latencia que se percibe:
+	// el render compone el frame que produjo el alpha, no el recien capturado.
+	if (!f->stats_on) return;
+	f->st_render_ns += os_gettime_ns() - t_render0;
+	f->st_render_n++;
+	if (!f->st_last_log) f->st_last_log = t_render0;
+	uint64_t span = t_render0 - f->st_last_log;
+	if (span >= 2000000000ULL) {
+		double s = span / 1e9;
+		blog(LOG_INFO, "[obs-ai-matting] stats %ux%u | edad %.1f ms | infer %.1f ms "
+		     "(%.0f/s) | render %.2f ms (%.0f/s) | entregas %.0f/s",
+		     w, h,
+		     f->st_age_n ? f->st_age_ns / 1e6 / f->st_age_n : 0.0,
+		     f->st_infer_acc_n ? f->st_infer_acc_ns / 1e6 / f->st_infer_acc_n : 0.0,
+		     f->st_infer_acc_n / s,
+		     f->st_render_n ? f->st_render_ns / 1e6 / f->st_render_n : 0.0,
+		     f->st_render_n / s, f->st_deliver_n / s);
+		f->st_age_ns = f->st_render_ns = f->st_infer_acc_ns = 0;
+		f->st_age_n = f->st_render_n = f->st_infer_acc_n = f->st_deliver_n = 0;
+		f->st_last_log = t_render0;
+	}
 }
 
 static void box_blur_bgra(const uint8_t *in, uint8_t *out, int W, int H, int radius)
