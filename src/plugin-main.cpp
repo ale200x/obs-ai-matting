@@ -173,12 +173,12 @@ static bool preload_cudnn()
 	if (state >= 0) return state == 1;
 	for (const char *name : {"libcudnn.so.9", "libcudnn.so"}) {
 		if (dlopen(name, RTLD_NOW | RTLD_GLOBAL)) {
-			blog(LOG_INFO, "[obs-ai-matting] cuDNN precargada (%s)", name);
+			blog(LOG_INFO, "[obs-ai-matting] preloaded cuDNN (%s)", name);
 			state = 1;
 			return true;
 		}
 	}
-	blog(LOG_INFO, "[obs-ai-matting] cuDNN no se pudo precargar (%s)", dlerror());
+	blog(LOG_INFO, "[obs-ai-matting] could not preload cuDNN (%s)", dlerror());
 	state = 0;
 	return false;
 }
@@ -216,8 +216,8 @@ static void ort_init(am_filter *f)
 				blog(LOG_INFO, "[obs-ai-matting] CUDA ON");
 			} catch (const std::exception &e) {
 				delete f->session; f->session = nullptr;
-				blog(LOG_WARNING, "[obs-ai-matting] CUDA no disponible (%s); "
-					"probando respaldo CPU", e.what());
+				blog(LOG_WARNING, "[obs-ai-matting] CUDA not available (%s); "
+					"trying CPU fallback", e.what());
 			}
 		}
 
@@ -230,10 +230,10 @@ static void ort_init(am_filter *f)
 			// Ruidoso a proposito: el filtro SIGUE FUNCIONANDO, solo que ~7x
 			// mas lento, asi que la degradacion no se nota como una rotura
 			// sino como "hoy va raro" y puede durar semanas sin diagnosticarse.
-			blog(LOG_ERROR, "[obs-ai-matting] *** RESPALDO CPU ACTIVO *** el matting "
-			     "corre en CPU: ~250 ms por frame en vez de ~35 ms, con medio segundo "
-			     "de retraso en camara virtual. Revisa que onnxruntime-opt-cuda, cuda "
-			     "y cudnn sean compatibles entre si.");
+			blog(LOG_ERROR, "[obs-ai-matting] *** CPU FALLBACK ACTIVE *** matting is "
+			     "running on the CPU: ~250 ms per frame instead of ~35 ms, which shows "
+			     "up as half a second of lag on the virtual camera. The CUDA provider "
+			     "could not be loaded - see the Troubleshooting section of the README.");
 		}
 		reset_states(f);
 		f->ort_ok = true;
@@ -747,8 +747,8 @@ static void am_render(void *data, gs_effect_t *)
 	uint64_t span = t_render0 - f->st_last_log;
 	if (span >= 2000000000ULL) {
 		double s = span / 1e9;
-		blog(LOG_INFO, "[obs-ai-matting] stats %ux%u | edad %.1f ms | infer %.1f ms "
-		     "(%.0f/s) | render %.2f ms (%.0f/s) | entregas %.0f/s",
+		blog(LOG_INFO, "[obs-ai-matting] stats %ux%u | age %.1f ms | infer %.1f ms "
+		     "(%.0f/s) | render %.2f ms (%.0f/s) | delivered %.0f/s",
 		     w, h,
 		     f->st_age_n ? f->st_age_ns / 1e6 / f->st_age_n : 0.0,
 		     f->st_infer_acc_n ? f->st_infer_acc_ns / 1e6 / f->st_infer_acc_n : 0.0,

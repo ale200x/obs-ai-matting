@@ -175,6 +175,78 @@ plugin instead of leaving you with a module that no longer loads. If you build m
 rebuild the plugin **before** opening OBS after an ONNX Runtime upgrade — once OBS opens
 with a broken module, the filter (and its settings) are already gone from the scene.
 
+### The filter works, but the video lags behind the audio
+
+**Symptom:** the mask is correct and nothing looks broken, but the camera feels heavy —
+in a video call your image trails your voice by roughly half a second, and OBS struggles
+to hold its frame rate. This one is easy to misread as a performance problem in the
+plugin, because the filter never actually fails.
+
+**Check the OBS log** for either of these lines:
+
+```
+[obs-ai-matting] CUDA not available (...Failed to load shared library); trying CPU fallback
+[obs-ai-matting] *** CPU FALLBACK ACTIVE *** matting is running on the CPU: ~250 ms per frame
+```
+
+The underlying error, visible with `ldd -r`, looks like this:
+
+```
+$ ldd -r /usr/lib/libonnxruntime_providers_cuda.so | grep cudnn
+undefined symbol: cudnnGetConvolutionBackwardDataAlgorithm_v7
+undefined symbol: cudnnGetConvolutionBackwardWorkspaceSize
+...
+```
+
+**Cause:** `libonnxruntime_providers_cuda.so` **does not link against libcuDNN** — it isn't
+in its `NEEDED` entries. It assumes cuDNN's symbols are already present in the process's
+global scope, which holds when a host has loaded cuDNN itself, and does not hold for OBS.
+The provider then fails to open, ONNX Runtime discards CUDA, and the plugin falls back to
+the CPU execution provider.
+
+That fallback is deliberate — losing the mask entirely would be worse — but it means a
+**silent 7× slowdown** rather than a visible failure, which is why it reads as lag instead
+of a bug. Measured on an RTX 4050 Laptop with a 640×480 source:
+
+| | CPU fallback | CUDA |
+|---|---|---|
+| Inference per frame | 161–337 ms | **34–73 ms** |
+| End-to-end filter latency | 220–510 ms | **57–128 ms** |
+| Inferences per second | 3–7 | **13–29** |
+
+Each CUDA figure is a range because this is a laptop GPU: the low end is a cold machine at
+full clocks, the high end is the same GPU thermally throttled to roughly half its boost
+clock, which doubles inference time. Expect to live nearer the high end during a long call.
+Either way it is several times faster than the CPU fallback, which throttles too.
+
+**Fix:** none needed since the plugin preloads cuDNN itself with
+`dlopen(RTLD_NOW | RTLD_GLOBAL)` before requesting the CUDA provider. If you are on an
+older build, update. Verified against `onnxruntime-opt-cuda` 1.29.0 with `cudnn` 9.25.1
+and CUDA 13.3 on Arch/CachyOS; the preload targets `libcudnn.so.9` and falls back to
+`libcudnn.so`, so a future cuDNN 10 will need that soname added.
+
+**Note for anything else using ONNX Runtime on the GPU:** the same packaging issue affects
+the Python bindings, so your own scripts may be silently running on the CPU too. The
+equivalent workaround is one line before creating the session:
+
+```python
+import ctypes; ctypes.CDLL("libcudnn.so.9", mode=ctypes.RTLD_GLOBAL)
+```
+
+### Measuring latency yourself
+
+Set `OBS_AI_MATTING_STATS=1` in the environment OBS runs in and the plugin logs a line
+every 2 seconds:
+
+```
+[obs-ai-matting] stats 640x480 | age 57.2 ms | infer 34.2 ms (28/s) | render 33.56 ms (29/s) | delivered 28/s
+```
+
+`age` is the one that matters: it's how old the displayed frame is, which is the
+latency a viewer actually perceives. The renderer composites the frame that produced the
+current alpha rather than the freshly captured one — that's what keeps fast movement from
+smearing — so the filter's latency is exactly the worker's cycle time, not a fixed frame count.
+
 ## FAQ
 
 **Is there a NVIDIA Broadcast for Linux?**
